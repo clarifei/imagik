@@ -1,0 +1,12 @@
+[build]
+# enable avx2 and other modern cpu features for better performance
+# this auto-detects your cpu capabilities during build
+# note: only enable this for local builds, not for portable deployment
+rustflags = ["-C", "target-cpu=native"]
+
+# alternative: force specific target features (if you know the deployment cpu)
+# rustflags = ["-C", "target-feature=+avx2,+sse4.2"]
+
+[term]
+# quiet output for cleaner builds
+quiet = false

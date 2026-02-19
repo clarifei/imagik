@@ -1,0 +1,6 @@
+an image transformation service inspired by cloudinary — but faster(fr), lighter, and maybe a bit sexierr.
+built entirely in rust to handle on-the-fly image processing with a focus on performance, efficiency, and simplicity.
+
+early benchmarks look promising, but things are still evolving.
+-- currently under active development (poc / mvp stage).
+features are incomplete, and it’s not production-ready yet.

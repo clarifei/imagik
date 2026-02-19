@@ -1,0 +1,39 @@
+[package]
+name = "imagik"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["mimalloc"]
+mimalloc = ["dep:mimalloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+
+[dependencies]
+ab_glyph = "0.2.32"
+axum = "0.8.8"
+fast_image_resize = { version = "6.0.0", features = ["image", "rayon"] }
+image = "0.25.9"
+imageproc = "0.26.0"
+libblur = { version = "0.23.1", features = ["image"] }
+mimalloc = { version = "0.1.43", default-features = false, optional = true }
+rand = "0.8"
+fastrand = "2"
+rayon = "1.7"
+tikv-jemallocator = { version = "0.6.1", optional = true }
+tokio = { version = "1.49.0", features = ["full"] }
+webp = "0.3.1"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+panic = "abort"
+codegen-units = 1
+debug = false
+overflow-checks = false
+
+[profile.release-with-debug]
+inherits = "release"
+strip = false
+debug = true
+opt-level = 2
