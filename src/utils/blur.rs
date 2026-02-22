@@ -1,5 +1,4 @@
-use crate::utils::resize::{resize_rgba, resize_rgba_fast};
-use fast_image_resize::FilterType;
+use crate::utils::resize::{resize_rgba, resize_rgba_fast_auto};
 use image::RgbaImage;
 use libblur::{
     BlurImage, BlurImageMut, ConvolutionMode, EdgeMode, EdgeMode2D, FastBlurChannels,
@@ -30,8 +29,18 @@ pub fn apply_blur(img: RgbaImage, sigma: f32) -> RgbaImage {
     let (working_img, adjusted_sigma) = if downscale_factor > 1 {
         let new_width = width / downscale_factor;
         let new_height = height / downscale_factor;
-        let downscaled = resize_rgba_fast(&img, new_width, new_height, FilterType::Lanczos3);
-        (downscaled, sigma * downscale_factor as f32)
+        // Use fast auto-selected filter for downscaling
+        let downscaled = resize_rgba_fast_auto(&img, new_width, new_height);
+        let sigma_multiplier = match downscale_factor {
+            4 => 4.0,
+            2 => 2.0,
+            _ => 1.0,
+        };
+        eprintln!(
+            "[BLUR] Downscaled {}x{} -> {}x{} for faster processing",
+            width, height, new_width, new_height
+        );
+        (downscaled, sigma * sigma_multiplier)
     } else {
         (img, sigma)
     };
@@ -55,7 +64,7 @@ pub fn parse_blur(value: &str) -> Option<f32> {
 /// applies libblur gaussian blur to rgba image.
 ///
 /// uses libblur for high-performance gaussian blur with adaptive threading.
-/// this is a low-level function used by apply_blur after downscaling.
+/// this is a low-level function used by `apply_blur` after downscaling.
 pub fn apply_libblur_rgba(img: &RgbaImage, sigma: f32) -> RgbaImage {
     let width = img.width();
     let height = img.height();
@@ -78,7 +87,7 @@ pub fn apply_libblur_rgba_into(
 ) {
     let src = BlurImage::borrow(src_rgba, width, height, FastBlurChannels::Channels4);
     let mut dst = BlurImageMut::borrow(dst_rgba, width, height, FastBlurChannels::Channels4);
-    let params = GaussianBlurParams::new_from_sigma(sigma as f64);
+    let params = GaussianBlurParams::new_from_sigma(f64::from(sigma));
 
     libblur::gaussian_blur(
         &src,

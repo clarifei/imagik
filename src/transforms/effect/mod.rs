@@ -1,3 +1,3 @@
 /// visual effects module.
-pub(crate) mod ca;
-pub(crate) mod grain;
+pub mod ca;
+pub mod grain;

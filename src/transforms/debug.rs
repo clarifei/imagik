@@ -15,10 +15,17 @@ static FONT: OnceLock<FontArc> = OnceLock::new();
 /// so it's readable on both thumbnails and full-res images.
 ///
 /// optimization: works directly on rgba to avoid dynamicimage conversion.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "Overlay coordinate conversion is clamped to image bounds before integer narrowing."
+)]
 pub fn apply_debug_overlay(img: &mut RgbaImage, processing_time_ms: u128) {
     let (width, height) = img.dimensions();
 
-    let text = format!("{}ms", processing_time_ms);
+    let text = format!("{processing_time_ms}ms");
 
     // get cached font or initialize on first use
     let font = FONT.get_or_init(|| {

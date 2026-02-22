@@ -2,12 +2,18 @@ use crate::models::Gravity;
 use crate::transforms::resize::crop_to_dimensions;
 use image::{DynamicImage, GenericImageView};
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "Aspect math converts between integer dimensions and float ratios; outputs are bounded and clamped."
+)]
 /// crops image to a target aspect ratio (e.g., "16:9", "1:1", "4:3").
 ///
 /// flow:
-/// 1. parse the aspect ratio string (format: "width:height")
+/// 1. parse the aspect ratio string (format: `width:height`)
 /// 2. calculate target dimensions that match the ratio
-/// 3. use the existing crop_to_dimensions to do the actual cropping
+/// 3. use the existing `crop_to_dimensions` to do the actual cropping
 ///
 /// edge cases:
 /// - invalid format: returns original image unchanged
@@ -17,9 +23,11 @@ use image::{DynamicImage, GenericImageView};
 /// uses `gravity` to determine which part of the image to keep when cropping.
 pub fn apply_aspect_ratio(img: DynamicImage, aspect_ratio: &str, gravity: Gravity) -> DynamicImage {
     let mut parts = aspect_ratio.splitn(2, ':');
-    let (width_str, height_str) = match (parts.next(), parts.next()) {
-        (Some(w), Some(h)) => (w, h),
-        _ => return img,
+    let Some(width_str) = parts.next() else {
+        return img;
+    };
+    let Some(height_str) = parts.next() else {
+        return img;
     };
 
     let Ok(width_ratio) = width_str.parse::<f32>() else {

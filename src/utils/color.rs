@@ -4,62 +4,76 @@
 ///
 /// this matches how human eyes actually perceive brightness
 /// (green contributes most, blue least).
-pub fn luminance(r: u8, g: u8, b: u8) -> u32 {
-    ((r as u32 * 299) + (g as u32 * 587) + (b as u32 * 114)) / 1000
+#[allow(
+    clippy::missing_const_for_fn,
+    reason = "`From` trait is not yet stable in const context (see rust-lang/rust#143874)."
+)]
+pub fn luminance(red: u8, green: u8, blue: u8) -> u32 {
+    ((u32::from(red) * 299) + (u32::from(green) * 587) + (u32::from(blue) * 114)) / 1000
 }
 
 /// converts rgb to hsv color space.
 ///
 /// returns (hue: 0-360, saturation: 0-1, value: 0-1)
-pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
-    let r = r as f32 / 255.0;
-    let g = g as f32 / 255.0;
-    let b = b as f32 / 255.0;
+pub fn rgb_to_hsv(red: u8, green: u8, blue: u8) -> (f32, f32, f32) {
+    let red = f32::from(red) / 255.0;
+    let green = f32::from(green) / 255.0;
+    let blue = f32::from(blue) / 255.0;
 
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let delta = max - min;
+    let max_channel = red.max(green).max(blue);
+    let min_channel = red.min(green).min(blue);
+    let delta = max_channel - min_channel;
+    let epsilon = f32::EPSILON;
 
-    let h = if delta == 0.0 {
+    let hue = if delta <= epsilon {
         0.0
-    } else if max == r {
-        60.0 * (((g - b) / delta) % 6.0)
-    } else if max == g {
-        60.0 * (((b - r) / delta) + 2.0)
+    } else if (max_channel - red).abs() <= epsilon {
+        60.0 * (((green - blue) / delta) % 6.0)
+    } else if (max_channel - green).abs() <= epsilon {
+        60.0 * (((blue - red) / delta) + 2.0)
     } else {
-        60.0 * (((r - g) / delta) + 4.0)
+        60.0 * (((red - green) / delta) + 4.0)
     };
-    let h = if h < 0.0 { h + 360.0 } else { h };
+    let hue = if hue < 0.0 { hue + 360.0 } else { hue };
 
-    let s = if max == 0.0 { 0.0 } else { delta / max };
-    let v = max;
+    let saturation = if max_channel <= epsilon {
+        0.0
+    } else {
+        delta / max_channel
+    };
+    let value = max_channel;
 
-    (h, s, v)
+    (hue, saturation, value)
 }
 
 /// converts hsv back to rgb.
-pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
-    let c = v * s;
-    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = v - c;
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "HSV conversion emits clamped `[0,255]` channel values before narrowing to `u8`."
+)]
+pub fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> (u8, u8, u8) {
+    let chroma = value * saturation;
+    let second = chroma * (1.0 - ((hue / 60.0) % 2.0 - 1.0).abs());
+    let match_value = value - chroma;
 
-    let (r, g, b) = if h < 60.0 {
-        (c, x, 0.0)
-    } else if h < 120.0 {
-        (x, c, 0.0)
-    } else if h < 180.0 {
-        (0.0, c, x)
-    } else if h < 240.0 {
-        (0.0, x, c)
-    } else if h < 300.0 {
-        (x, 0.0, c)
+    let (red, green, blue) = if hue < 60.0 {
+        (chroma, second, 0.0)
+    } else if hue < 120.0 {
+        (second, chroma, 0.0)
+    } else if hue < 180.0 {
+        (0.0, chroma, second)
+    } else if hue < 240.0 {
+        (0.0, second, chroma)
+    } else if hue < 300.0 {
+        (second, 0.0, chroma)
     } else {
-        (c, 0.0, x)
+        (chroma, 0.0, second)
     };
 
     (
-        ((r + m) * 255.0) as u8,
-        ((g + m) * 255.0) as u8,
-        ((b + m) * 255.0) as u8,
+        ((red + match_value) * 255.0).clamp(0.0, 255.0) as u8,
+        ((green + match_value) * 255.0).clamp(0.0, 255.0) as u8,
+        ((blue + match_value) * 255.0).clamp(0.0, 255.0) as u8,
     )
 }

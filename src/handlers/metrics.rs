@@ -1,4 +1,4 @@
-use crate::utils::metrics::render_prometheus;
+use crate::observability::metrics::render_prometheus;
 use axum::{
     http::{StatusCode, header::CONTENT_TYPE},
     response::IntoResponse,

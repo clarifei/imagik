@@ -1,8 +1,7 @@
 use super::params::Params;
+use crate::encoding::webp::{calculate_webp_quality, encode_rgba_image_to_webp, encode_to_webp};
+use crate::observability::metrics::{self, PipelineStage};
 use crate::transforms::aspect::apply_aspect_ratio;
-use crate::transforms::compress::{
-    calculate_webp_quality, encode_rgba_image_to_webp, encode_to_webp,
-};
 use crate::transforms::debug::apply_debug_overlay;
 use crate::transforms::effect::ca::apply_chromatic;
 use crate::transforms::effect::grain::apply_grain;
@@ -13,12 +12,17 @@ use crate::utils::color::{hsv_to_rgb, luminance, rgb_to_hsv};
 use crate::utils::image::to_rgba;
 use crate::utils::pixel::process_pixels_par;
 use image::RgbaImage;
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
-static SOURCE_RGBA_CACHE: OnceLock<Arc<RgbaImage>> = OnceLock::new();
-
-/// the main transformation pipeline — fully optimized.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::many_single_char_names,
+    reason = "hot-path pixel math requires float/int conversions; values are explicitly clamped before narrowing"
+)]
+/// main image transformation pipeline.
 ///
 /// optimization strategies:
 /// 1. early exit: if no transforms needed, encode source directly without conversion
@@ -29,52 +33,80 @@ static SOURCE_RGBA_CACHE: OnceLock<Arc<RgbaImage>> = OnceLock::new();
 /// 6. grain effects combined in single pass when both specified
 /// 7. encode rgba directly without dynamicimage conversion
 /// 8. conditional rgba conversion (only if pixel ops needed)
-pub fn apply_transforms_and_convert(
-    source: Arc<image::DynamicImage>,
-    params: Params,
-) -> Result<Vec<u8>, String> {
+pub fn apply_transforms_and_convert(source: &image::DynamicImage, params: &Params) -> Vec<u8> {
     let start_time = Instant::now();
+    let transform_stage_start = Instant::now();
+
+    eprintln!(
+        "[PIPELINE] Starting transform pipeline for {}x{} image",
+        source.width(),
+        source.height()
+    );
 
     // early exit: format conversion only (no geometry/effects/overlay)
     if !params.has_transforms() {
-        return encode_dynamicimage_to_webp(
-            source.as_ref(),
-            params.webp_quality,
-            params.webp_lossless,
-        );
+        let encode_start = Instant::now();
+        let encoded =
+            encode_dynamicimage_to_webp(source, params.webp_quality, params.webp_lossless);
+        metrics::record_stage_latency(PipelineStage::Encode, encode_start.elapsed());
+        return encoded;
     }
 
     // apply geometric transforms - returns rgba directly to avoid conversions
-    let mut rgba_img = apply_geometric_transforms(source.as_ref(), &params);
+    let geo_start = Instant::now();
+    let mut rgba_img = apply_geometric_transforms(source, params);
+    eprintln!(
+        "[PIPELINE] Geometric transforms (resize/rotate): {:?}",
+        geo_start.elapsed()
+    );
 
     // check if we need pixel-level operations (blur, color filters, effects)
     let needs_pixel_ops = params.has_pixel_ops();
 
     // optimization: if only geometric transforms, encode directly
     if !needs_pixel_ops && !params.debug {
-        return encode_rgba_to_webp(&rgba_img, params.webp_quality, params.webp_lossless);
+        metrics::record_stage_latency(PipelineStage::Transform, transform_stage_start.elapsed());
+        let encode_start = Instant::now();
+        let encoded = encode_rgba_to_webp(&rgba_img, params.webp_quality, params.webp_lossless);
+        eprintln!("[PIPELINE] WebP encoding: {:?}", encode_start.elapsed());
+        metrics::record_stage_latency(PipelineStage::Encode, encode_start.elapsed());
+        return encoded;
     }
 
     // apply pixel-level operations in optimal order
     // blur first (on potentially smaller image after resize)
     if let Some(sigma) = params.blur {
+        let blur_start = Instant::now();
         rgba_img = apply_blur(rgba_img, sigma);
+        eprintln!(
+            "[PIPELINE] Blur (sigma={}): {:?}",
+            sigma,
+            blur_start.elapsed()
+        );
     }
 
     // color filters - one pass with fast path for simple operations
-    apply_color_filters(&mut rgba_img, &params);
+    let color_start = Instant::now();
+    apply_color_filters(&mut rgba_img, params);
+    eprintln!("[PIPELINE] Color filters: {:?}", color_start.elapsed());
 
     // grain effects - combined in single pass if both specified
-    rgba_img = apply_grain(
-        rgba_img,
-        params.grain,
-        params.grain_grayscale,
-        params.grain_threshold,
-    );
+    if params.grain.is_some() || params.grain_grayscale.is_some() {
+        let grain_start = Instant::now();
+        rgba_img = apply_grain(
+            rgba_img,
+            params.grain,
+            params.grain_grayscale,
+            params.grain_threshold,
+        );
+        eprintln!("[PIPELINE] Grain effect: {:?}", grain_start.elapsed());
+    }
 
     // chromatic aberration - lens distortion effect
     if let Some(amount) = params.chromatic_aberration {
+        let ca_start = Instant::now();
         apply_chromatic(&mut rgba_img, amount, 1.0);
+        eprintln!("[PIPELINE] Chromatic aberration: {:?}", ca_start.elapsed());
     }
 
     // debug overlay (if enabled) and encoding
@@ -83,29 +115,33 @@ pub fn apply_transforms_and_convert(
         apply_debug_overlay(&mut rgba_img, processing_time);
     }
 
-    encode_rgba_to_webp(&rgba_img, params.webp_quality, params.webp_lossless)
+    metrics::record_stage_latency(PipelineStage::Transform, transform_stage_start.elapsed());
+    let encode_start = Instant::now();
+    let encoded = encode_rgba_to_webp(&rgba_img, params.webp_quality, params.webp_lossless);
+    eprintln!("[PIPELINE] WebP encoding: {:?}", encode_start.elapsed());
+    metrics::record_stage_latency(PipelineStage::Encode, encode_start.elapsed());
+    eprintln!("[PIPELINE] Total pipeline time: {:?}", start_time.elapsed());
+    encoded
 }
 
-/// applies geometric transforms chained in dynamicimage format.
+/// applies geometric transforms with minimal format conversions.
 ///
-/// key optimization: skip aspect ratio crop if resize is present.
-/// resize_with_mode already handles aspect ratio preservation.
-/// applies geometric transforms and returns rgba image directly.
+/// optimization: chains rotation and aspect crop in `DynamicImage` format,
+/// converting to `RgbaImage` only once at the end. avoids back-and-forth
+/// conversions that would occur if each transform converted independently.
 ///
-/// optimization: avoids unnecessary dynamicimage -> rgba -> dynamicimage conversions
-/// by staying in dynamicimage for rotations/aspect crop, then converting once to rgba
-/// for resize operations.
+/// aspect ratio crop is skipped if resize is present (resize handles aspect).
 fn apply_geometric_transforms(source: &image::DynamicImage, params: &Params) -> RgbaImage {
     let needs_resize = params.width.is_some() || params.height.is_some();
     let needs_rotation = params.rotate.is_some();
     let needs_aspect = params.aspect.is_some() && !needs_resize;
 
     if !needs_rotation && !needs_aspect {
-        let source_rgba = cached_source_rgba(source);
+        let source_rgba = source.to_rgba8();
 
         if needs_resize {
             return resize_with_mode_rgba(
-                source_rgba.as_ref(),
+                &source_rgba,
                 params.width,
                 params.height,
                 params.crop_mode,
@@ -113,7 +149,7 @@ fn apply_geometric_transforms(source: &image::DynamicImage, params: &Params) -> 
                 params.background,
             );
         }
-        return source_rgba.as_ref().clone();
+        return source_rgba;
     }
 
     let mut img = source.clone();
@@ -145,20 +181,23 @@ fn apply_geometric_transforms(source: &image::DynamicImage, params: &Params) -> 
     }
 }
 
-fn cached_source_rgba(source: &image::DynamicImage) -> Arc<RgbaImage> {
-    if let Some(cached) = SOURCE_RGBA_CACHE.get() {
-        return Arc::clone(cached);
-    }
-
-    let rgba = Arc::new(source.to_rgba8());
-    let _ = SOURCE_RGBA_CACHE.set(Arc::clone(&rgba));
-    SOURCE_RGBA_CACHE.get().map(Arc::clone).unwrap_or(rgba)
-}
-
-/// applies color filters with optimal path selection.
+/// applies color filters with multi-tier optimization.
 ///
-/// optimization: separate fast path for simple operations (grayscale/invert only)
-/// that avoids expensive HSV conversion entirely.
+/// path selection (fastest to slowest):
+/// 1. no-op: no color adjustments requested
+/// 2. simple: only grayscale/invert (no HSV conversion)
+/// 3. rgb: brightness/contrast only (no HSV conversion)
+/// 4. full: hue/saturation/vibrance requiring HSV conversion
+///
+/// all paths use `process_pixels_par` for parallel pixel processing.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    reason = "Color pipeline math runs in tight loops with explicit clamping before integer conversion."
+)]
 fn apply_color_filters(rgba_img: &mut RgbaImage, params: &Params) {
     let has_brightness = params.brightness.is_some();
     let has_contrast = params.contrast.is_some();
@@ -186,9 +225,9 @@ fn apply_color_filters(rgba_img: &mut RgbaImage, params: &Params) {
 
     if !needs_hsv {
         process_pixels_par(rgba_img, |pixel| {
-            let mut r = pixel[0] as f32;
-            let mut g = pixel[1] as f32;
-            let mut b = pixel[2] as f32;
+            let mut r = f32::from(pixel[0]);
+            let mut g = f32::from(pixel[1]);
+            let mut b = f32::from(pixel[2]);
 
             if has_brightness {
                 r = (r * brightness_factor).clamp(0.0, 255.0);
@@ -197,9 +236,15 @@ fn apply_color_filters(rgba_img: &mut RgbaImage, params: &Params) {
             }
 
             if has_contrast {
-                r = ((r - 127.5) * contrast_factor + 127.5).clamp(0.0, 255.0);
-                g = ((g - 127.5) * contrast_factor + 127.5).clamp(0.0, 255.0);
-                b = ((b - 127.5) * contrast_factor + 127.5).clamp(0.0, 255.0);
+                r = (r - 127.5)
+                    .mul_add(contrast_factor, 127.5)
+                    .clamp(0.0, 255.0);
+                g = (g - 127.5)
+                    .mul_add(contrast_factor, 127.5)
+                    .clamp(0.0, 255.0);
+                b = (b - 127.5)
+                    .mul_add(contrast_factor, 127.5)
+                    .clamp(0.0, 255.0);
             }
 
             if params.grayscale {
@@ -224,9 +269,9 @@ fn apply_color_filters(rgba_img: &mut RgbaImage, params: &Params) {
     }
 
     process_pixels_par(rgba_img, |pixel| {
-        let mut r = pixel[0] as f32;
-        let mut g = pixel[1] as f32;
-        let mut b = pixel[2] as f32;
+        let mut r = f32::from(pixel[0]);
+        let mut g = f32::from(pixel[1]);
+        let mut b = f32::from(pixel[2]);
 
         if has_brightness {
             r = (r * brightness_factor).clamp(0.0, 255.0);
@@ -235,9 +280,15 @@ fn apply_color_filters(rgba_img: &mut RgbaImage, params: &Params) {
         }
 
         if has_contrast {
-            r = ((r - 127.5) * contrast_factor + 127.5).clamp(0.0, 255.0);
-            g = ((g - 127.5) * contrast_factor + 127.5).clamp(0.0, 255.0);
-            b = ((b - 127.5) * contrast_factor + 127.5).clamp(0.0, 255.0);
+            r = (r - 127.5)
+                .mul_add(contrast_factor, 127.5)
+                .clamp(0.0, 255.0);
+            g = (g - 127.5)
+                .mul_add(contrast_factor, 127.5)
+                .clamp(0.0, 255.0);
+            b = (b - 127.5)
+                .mul_add(contrast_factor, 127.5)
+                .clamp(0.0, 255.0);
         }
 
         if params.grayscale {
@@ -276,6 +327,10 @@ fn apply_color_filters(rgba_img: &mut RgbaImage, params: &Params) {
     });
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Luminance is bounded to `[0,255]` before narrowing."
+)]
 /// fast path for simple filters without HSV conversion.
 /// grayscale: average rgb channels using luminance weights
 /// invert: flip all channels
@@ -297,13 +352,9 @@ fn apply_simple_filters(img: &mut RgbaImage, grayscale: bool, invert: bool) {
 }
 
 /// encodes rgba image directly to webp with calculated quality.
-fn encode_rgba_to_webp(
-    img: &RgbaImage,
-    webp_quality: Option<u32>,
-    webp_lossless: bool,
-) -> Result<Vec<u8>, String> {
+fn encode_rgba_to_webp(img: &RgbaImage, webp_quality: Option<u32>, webp_lossless: bool) -> Vec<u8> {
     let quality = calculate_webp_quality(webp_quality, webp_lossless);
-    encode_rgba_image_to_webp(img, quality).map_err(|_| "failed to encode to webp".to_string())
+    encode_rgba_image_to_webp(img, quality)
 }
 
 /// encodes dynamicimage directly to webp without conversion.
@@ -312,7 +363,7 @@ fn encode_dynamicimage_to_webp(
     img: &image::DynamicImage,
     webp_quality: Option<u32>,
     webp_lossless: bool,
-) -> Result<Vec<u8>, String> {
+) -> Vec<u8> {
     let quality = calculate_webp_quality(webp_quality, webp_lossless);
-    encode_to_webp(img, quality).map_err(|_| "failed to encode to webp".to_string())
+    encode_to_webp(img, quality)
 }

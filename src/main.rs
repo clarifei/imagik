@@ -1,10 +1,16 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-mod aliases;
+mod caching;
+mod common;
+mod config;
+mod encoding;
 mod handlers;
 mod models;
-mod routes;
+mod observability;
+mod pipeline;
+mod routing;
+mod storage;
 mod transforms;
 mod utils;
 
@@ -19,62 +25,16 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-struct RuntimeConfig {
-    max_blocking_threads: usize,
-    blocking_keep_alive_ms: u64,
-    rss_sample_interval_ms: u64,
-}
-
-impl RuntimeConfig {
-    fn from_env() -> Self {
-        let cpu = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        let max_blocking_threads = parse_env_usize(
-            "IMAGIK_MAX_BLOCKING_THREADS",
-            cpu.saturating_mul(2).max(1),
-            1,
-        );
-        let blocking_keep_alive_ms =
-            parse_env_u64("IMAGIK_BLOCKING_KEEP_ALIVE_MS", 3_000, 250).max(250);
-        let rss_sample_interval_ms =
-            parse_env_u64("IMAGIK_RSS_SAMPLE_INTERVAL_MS", 1_000, 100).max(100);
-
-        Self {
-            max_blocking_threads,
-            blocking_keep_alive_ms,
-            rss_sample_interval_ms,
-        }
-    }
-}
-
-fn parse_env_usize(key: &str, default: usize, min: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v >= min)
-        .unwrap_or(default)
-}
-
-fn parse_env_u64(key: &str, default: u64, min: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v >= min)
-        .unwrap_or(default)
-}
-
 /// entry point for the imagik server.
 ///
-/// quick overview of the flow:
+/// overview:
 /// - sets up axum routes on port 3000
-/// - prints available params (mostly for dev convenience)
+/// - prints available params (dev convenience)
 /// - serves image transformation requests
-///
-/// note: currently hardcoded to use `image.jpg` as the source image.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let runtime_config = RuntimeConfig::from_env();
-    let transform_concurrency = handlers::transform::configured_transform_concurrency();
+    dotenvy::dotenv().ok();
+    let runtime_config = config::runtime::RuntimeConfig::from_env();
+    let transform_concurrency = config::runtime::configured_transform_concurrency();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .max_blocking_threads(runtime_config.max_blocking_threads)
@@ -85,14 +45,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn async_main(
-    runtime_config: RuntimeConfig,
+    runtime_config: config::runtime::RuntimeConfig,
     transform_concurrency: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app = routes::create_routes();
+    let app = routing::create_routes();
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
     println!("imagik server");
-    println!("http://{}", addr);
+    println!("http://{addr}");
     println!(
         "runtime: max_blocking_threads={}, transform_concurrency={}, blocking_keep_alive_ms={}, rss_sample_interval_ms={}",
         runtime_config.max_blocking_threads,
@@ -101,7 +61,7 @@ async fn async_main(
         runtime_config.rss_sample_interval_ms
     );
     println!();
-    println!("params:");
+    println!("transform query params:");
     println!("  w/h              - width/height");
     println!("  c                - crop: fill, fit, scale, pad");
     println!("  g                - gravity: center, n, s, e, w");
@@ -122,18 +82,27 @@ async fn async_main(
     println!("  graingray        - grayscale grain mode");
     println!("  grainthresh      - black threshold 0-1 (default 0.08)");
     println!("  ca               - chromatic aberration 0.0-0.1");
+    println!("  format           - output format (webp only)");
     println!("  debug            - show timing overlay");
     println!();
-    println!("example: curl http://{}/w_500,h_500,c_fill,wq_80", addr);
-    println!("metrics: curl http://{}/metrics", addr);
+    println!("example: curl \"http://{addr}/image/photos/deer.jpg?w=500&h=500&c=fill&wq=80\"");
+    println!(
+        "source: object storage via IMAGIK_STORAGE_* env vars (S3-compatible or signed-url template)"
+    );
+    println!(
+        "cache: Redis/Dragonfly via IMAGIK_CACHE_URL (+ optional IMAGIK_HOT_CACHE_* in-process LRU)"
+    );
+    println!("metrics: curl http://{addr}/metrics");
 
-    utils::metrics::set_runtime_limits(
+    observability::metrics::set_runtime_limits(
         runtime_config.max_blocking_threads,
         transform_concurrency,
         runtime_config.blocking_keep_alive_ms,
         runtime_config.rss_sample_interval_ms,
     );
-    utils::metrics::start_rss_sampler(Duration::from_millis(runtime_config.rss_sample_interval_ms));
+    observability::metrics::start_rss_sampler(Duration::from_millis(
+        runtime_config.rss_sample_interval_ms,
+    ));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

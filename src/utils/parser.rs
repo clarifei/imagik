@@ -19,7 +19,7 @@ pub fn parse_positive_f32(value: &str) -> Option<f32> {
 }
 
 /// normalizes a hue value to 0-359 range using modulo arithmetic.
-pub fn normalize_hue(value: i32) -> i32 {
+pub const fn normalize_hue(value: i32) -> i32 {
     value.rem_euclid(360)
 }
 

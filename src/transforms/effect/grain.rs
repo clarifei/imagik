@@ -12,14 +12,14 @@ static COLOR_NOISE: OnceLock<Vec<(i8, i8, i8)>> = OnceLock::new();
 
 fn init_noise() {
     GRAYSCALE_NOISE.get_or_init(|| {
-        let mut rng = fastrand::Rng::with_seed(0x123456789abcdef);
+        let mut rng = fastrand::Rng::with_seed(0x0123_4567_89ab_cdef);
         (0..(NOISE_SIZE * NOISE_SIZE))
             .map(|_| rng.i8(-51..=51))
             .collect()
     });
 
     COLOR_NOISE.get_or_init(|| {
-        let mut rng = fastrand::Rng::with_seed(0xfedcba9876543210);
+        let mut rng = fastrand::Rng::with_seed(0xfedc_ba98_7654_3210);
         (0..(NOISE_SIZE * NOISE_SIZE))
             .map(|_| (rng.i8(-51..=51), rng.i8(-51..=51), rng.i8(-51..=51)))
             .collect()
@@ -30,6 +30,12 @@ fn init_noise() {
 ///
 /// optimized version that handles both color and grayscale grain in a single pass
 /// when both are specified, using precomputed noise textures.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "Noise synthesis blends precomputed i8 fields into u8 channels with explicit clamping."
+)]
 pub fn apply_grain(
     mut rgba_img: RgbaImage,
     color_grain: Option<f32>,
@@ -99,6 +105,12 @@ pub fn parse_grain_threshold(value: &str) -> Option<f32> {
 }
 
 /// internal: applies single type of grain (color or grayscale).
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "Noise math intentionally uses clamped float/int channel blending in tight loops."
+)]
 fn apply_single_grain(
     mut rgba_img: RgbaImage,
     intensity: f32,

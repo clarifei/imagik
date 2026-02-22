@@ -1,6 +1,127 @@
-an image transformation service inspired by cloudinary — but faster(fr), lighter, and maybe a bit sexierr.
-built entirely in rust to handle on-the-fly image processing with a focus on performance, efficiency, and simplicity.
+# imagik
 
-early benchmarks look promising, but things are still evolving.
--- currently under active development (poc / mvp stage).
-features are incomplete, and it’s not production-ready yet.
+`imagik` transforms images from object storage (AWS S3 / Cloudflare R2 compatible) and returns WebP output.
+
+## Code Layout
+
+The project is organized by request flow and responsibility:
+
+- `src/routing`: HTTP route table.
+- `src/handlers`: thin HTTP handlers (`image`, `metrics`).
+- `src/pipeline`: query parsing, normalized params, transform runner.
+- `src/transforms`: geometric/effect/filter transforms.
+- `src/encoding`: output encoding (`webp`).
+- `src/caching`: external + in-process cache layers.
+- `src/storage`: object storage integration (S3/signed URL + optional disk source cache).
+- `src/observability`: metrics and runtime telemetry.
+- `src/config`: centralized runtime/decode/env config helpers.
+- `src/utils`: low-level image/math/pixel helpers shared by transforms.
+
+Notable second-pass module boundaries:
+- `src/caching/external/*`: `config`, `keys`, `hot_cache`, `store`, `locks`, `info_sampler`.
+- `src/storage/object/*`: `config`, `client`, `fetch`, `disk_cache`, `key`, `retry`.
+
+## API Contract
+
+### Base endpoint
+- `GET /image/{object_key}`
+- `{object_key}` maps directly to the storage object key and supports nested paths (example: `photos/deer.jpg`).
+
+### Query params
+- Query string contains transform and encode options.
+- Example aliases:
+  - `w`, `h` (width, height)
+  - `c` (crop mode: `fill|fit|scale|pad`)
+  - `g` (gravity: `center|n|s|e|w`)
+  - `ar` (aspect ratio, e.g. `16:9`)
+  - `r` (rotate: `0|90|180|270`)
+  - `b` (background color)
+  - `blur`
+  - `brightness`, `contrast`, `hue`, `grayscale`, `invert`, `saturation`, `vibrance`
+  - `grain`, `graingray`, `grainthresh`
+  - `ca` (chromatic aberration)
+  - `wq` (webp quality), `wl` (webp lossless)
+  - `format` (`webp` only)
+  - `debug`
+
+### Required params
+- No transform query params are required.
+- `object_key` is required.
+
+### Output
+- Response content type: `image/webp`.
+
+### Example URLs
+- `/image/photos/deer.jpg?w=800&h=450&c=fill&wq=82`
+- `/image/photos/deer.jpg?ar=16:9&g=center&blur=1.6&format=webp`
+- `/image/gallery/hero/banner.png?w=1600&h=900&c=fit&ca=0.02`
+
+## Object Key Safety Rules
+
+Incoming `{object_key}` is decoded and validated:
+- must be valid UTF-8
+- must not be empty
+- rejects `.` and `..` path segments
+- rejects empty path segments and backslashes
+- max key length is capped
+
+## Caching Architecture
+
+### L1: In-process hot cache (optional)
+- Stores final encoded output only.
+- Strictly bounded by item count and byte caps.
+- Optimizes p95/p99 latency for very hot transforms.
+
+### L2: External final transform cache (primary)
+- Stores final encoded output only (not RGBA).
+- Cache key includes:
+  - object key
+  - object version token (version-id / etag / last-modified fallback)
+  - normalized transform signature hash
+  - output format + quality settings (included in signature)
+- Primary layer for avoiding repeated CPU transform/encode work.
+
+### L3: External source bytes cache (secondary)
+- Stores source object bytes (compressed/original form).
+- Shorter TTL than final transform cache.
+- Prevents repeated object storage reads.
+
+### Stampede protection
+- Distributed lock per final result key.
+- Distributed lock per source key/version.
+- Result lock is acquired before fetch/decode/transform so only the lock holder performs heavy work.
+- Lock heartbeats extend TTL for long-running transforms.
+
+### Invalidation strategy
+- Version-aware keys use object storage metadata (version-id / etag / last-modified).
+- Object updates naturally shift cache keys.
+- Version token metadata is cached briefly and refreshed.
+- Unknown-version final cache entries are short-lived (or disabled) to reduce stale risk.
+
+### Safety controls
+- Max cacheable payload size for source/result entries.
+- Hot cache strict byte cap + LRU eviction.
+- No external raw RGBA caching.
+- Decode safety limits: max dimensions, max pixels, and max decode allocation budget.
+- Optional disk source cache includes a global size cap with eviction.
+
+## Observability
+
+`/metrics` includes:
+- hit/miss/store/error counters per cache layer (`source`, `result`, `version`, `hot_result`)
+- cache latency percentiles by operation (`get`, `set`)
+- lock contention/timeouts and lock wait latency
+- stage latency percentiles (`object_fetch`, `decode`, `transform`, `encode`)
+- storage retry counts and unknown-version request counts
+- external cache memory and evicted keys (from Redis/Dragonfly INFO)
+- process RSS/threads and request/processing latency percentiles
+
+## Environment Configuration
+
+Use `.env.example` as the source of truth.
+
+Main groups:
+- object storage configuration (`IMAGIK_STORAGE_*`)
+- external cache controls (`IMAGIK_CACHE_*`)
+- in-process hot cache controls (`IMAGIK_HOT_CACHE_*`)
+- runtime knobs (`IMAGIK_MAX_BLOCKING_THREADS`, `IMAGIK_TRANSFORM_CONCURRENCY`, etc.)

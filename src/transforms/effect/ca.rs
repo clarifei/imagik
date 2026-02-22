@@ -1,9 +1,8 @@
-use crate::utils::metrics::{self, ScratchBuffer};
+use crate::observability::metrics::{self, ScratchBuffer};
 use crate::utils::parser::parse_positive_f32;
 use crate::utils::resize::resize_rgba_into;
 use fast_image_resize::FilterType;
 use image::RgbaImage;
-use rayon::prelude::*;
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
@@ -25,6 +24,10 @@ struct BufferMeta {
 }
 
 impl BufferMeta {
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "Uses `Instant`, which is runtime data and not meaningful in const context."
+    )]
     fn note_growth(&mut self, request_index: u64, now: Instant) {
         self.last_growth_request = request_index;
         self.last_growth_at = Some(now);
@@ -44,26 +47,27 @@ thread_local! {
     static CA_SCRATCH: RefCell<CaScratch> = RefCell::new(CaScratch::default());
 }
 
-/// applies chromatic aberration effect.
+/// applies chromatic aberration lens distortion effect.
 ///
-/// simulates lens distortion by offsetting color channels radially from center.
-/// red channel is shifted outward, blue inward, green stays centered.
-///
-/// # arguments
-/// * `img` - image to modify (in-place)
-/// * `amount` - strength of the effect (0.0 to 0.02 recommended)
-/// * `radial` - how much effect increases toward edges (0.0 = uniform, 1.0 = radial falloff)
-///
-/// optimized version: processes at half resolution then upscales.
-/// ca is a subtle artistic effect that doesn't need full resolution processing.
-/// this reduces memory bandwidth by ~4x and computation by ~4x.
-///
-/// simulates lens distortion by offsetting color channels radially from center.
-/// red channel is shifted outward, blue inward, green stays centered.
+/// simulates lens distortion by offsetting color channels radially from center:
+/// - red channel shifted outward
+/// - blue channel shifted inward
+/// - green channel stays centered
 ///
 /// parameters:
-/// - amount: strength of the effect (0.0 to 0.02 recommended)
-/// - radial: how much effect increases toward edges (0.0 = uniform, 1.0 = radial falloff)
+/// - `amount`: effect strength, 0.0-0.02 recommended range
+/// - `radial`: edge enhancement, 0.0=uniform, 1.0=radial falloff
+///
+/// performance optimization: processes at half resolution then upscales.
+/// ca is a subtle artistic effect that works fine at reduced resolution.
+/// memory bandwidth and computation reduced by ~4x.
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "Scratch-buffer orchestration is intentionally linear to keep retention and trim decisions explicit."
+)]
 pub fn apply_chromatic(img: &mut RgbaImage, amount: f32, radial: f32) {
     if amount <= 0.0 {
         return;
@@ -224,7 +228,10 @@ fn ensure_len(buf: &mut Vec<u8>, len: usize) -> bool {
     false
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Buffer management requires 8 parameters for proper memory optimization (capacity, usage patterns, idle detection, etc.)."
+)]
 fn maybe_trim_buffer(
     buf: &mut Vec<u8>,
     meta: BufferMeta,
@@ -269,6 +276,14 @@ fn should_decay(meta: BufferMeta, request_index: u64, now: Instant) -> bool {
 }
 
 /// applies CA from source RGBA bytes into a preallocated output buffer.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::similar_names,
+    clippy::suboptimal_flops,
+    reason = "Lens distortion sampling is float-heavy and conversion points are clamped before index narrowing."
+)]
 fn apply_ca_raw(
     source_raw: &[u8],
     result_raw: &mut [u8],
@@ -283,76 +298,72 @@ fn apply_ca_raw(
     debug_assert!(source_raw.len() >= (width * height * 4) as usize);
     debug_assert!(result_raw.len() >= (width * height * 4) as usize);
 
-    // parallel processing for red and blue channel shifts
-    result_raw
-        .par_chunks_exact_mut(row_stride)
-        .enumerate()
-        .for_each(|(y, row)| {
-            let y = y as u32;
-            let uv_y = y as f32 / height_f;
+    for (y, row) in result_raw.chunks_exact_mut(row_stride).enumerate() {
+        let y = y as u32;
+        let uv_y = y as f32 / height_f;
 
-            for (x, pixel_bytes) in row.chunks_exact_mut(4).enumerate() {
-                let x = x as u32;
-                let src_idx = ((y * width + x) * 4) as usize;
+        for (x, pixel_bytes) in row.chunks_exact_mut(4).enumerate() {
+            let x = x as u32;
+            let src_idx = ((y * width + x) * 4) as usize;
 
-                // copy channels that are not spatially shifted.
-                pixel_bytes[1] = source_raw[src_idx + 1];
-                pixel_bytes[3] = source_raw[src_idx + 3];
+            // copy channels that are not spatially shifted.
+            pixel_bytes[1] = source_raw[src_idx + 1];
+            pixel_bytes[3] = source_raw[src_idx + 3];
 
-                // normalized uv coordinates (0.0 to 1.0)
-                let uv_x = x as f32 / width_f;
+            // normalized uv coordinates (0.0 to 1.0)
+            let uv_x = x as f32 / width_f;
 
-                // center coordinates (-0.5 to 0.5)
-                let center_x_norm = uv_x - 0.5;
-                let center_y_norm = uv_y - 0.5;
+            // center coordinates (-0.5 to 0.5)
+            let center_x_norm = uv_x - 0.5;
+            let center_y_norm = uv_y - 0.5;
 
-                // distance from center (0.0 at center, ~0.7 at corners)
-                let dist_sq = center_x_norm * center_x_norm + center_y_norm * center_y_norm;
-                let dist = dist_sq.sqrt();
+            // distance from center (0.0 at center, ~0.7 at corners)
+            let dist_sq = center_x_norm * center_x_norm + center_y_norm * center_y_norm;
+            let dist = dist_sq.sqrt();
 
-                // calculate shift amount (mix between uniform and radial)
-                let shift = amount * (1.0 - radial + radial * dist * 2.0);
+            // calculate shift amount (mix between uniform and radial)
+            let shift = amount * (1.0 - radial + radial * dist * 2.0);
 
-                // edge fade: reduce effect near image boundaries to avoid stretching artifacts
-                let dist_to_edge_x = uv_x.min(1.0 - uv_x);
-                let dist_to_edge_y = uv_y.min(1.0 - uv_y);
-                let dist_to_edge = dist_to_edge_x.min(dist_to_edge_y);
+            // edge fade: reduce effect near image boundaries to avoid stretching artifacts
+            let dist_to_edge_x = uv_x.min(1.0 - uv_x);
+            let dist_to_edge_y = uv_y.min(1.0 - uv_y);
+            let dist_to_edge = dist_to_edge_x.min(dist_to_edge_y);
 
-                let fade_threshold = shift * 1.5;
-                let edge_fade = if dist_to_edge >= fade_threshold {
-                    1.0
-                } else {
-                    dist_to_edge / fade_threshold
-                };
+            let fade_threshold = shift * 1.5;
+            let edge_fade = if dist_to_edge >= fade_threshold {
+                1.0
+            } else {
+                dist_to_edge / fade_threshold
+            };
 
-                let adjusted_shift = shift * edge_fade;
+            let adjusted_shift = shift * edge_fade;
 
-                if dist > 0.0001 && adjusted_shift > 0.0 {
-                    let dir_x = center_x_norm / dist;
-                    let dir_y = center_y_norm / dist;
+            if dist > 0.0001 && adjusted_shift > 0.0 {
+                let dir_x = center_x_norm / dist;
+                let dir_y = center_y_norm / dist;
 
-                    let r_x = uv_x + dir_x * adjusted_shift;
-                    let r_y = uv_y + dir_y * adjusted_shift;
-                    let b_x = uv_x - dir_x * adjusted_shift;
-                    let b_y = uv_y - dir_y * adjusted_shift;
+                let r_x = uv_x + dir_x * adjusted_shift;
+                let r_y = uv_y + dir_y * adjusted_shift;
+                let b_x = uv_x - dir_x * adjusted_shift;
+                let b_y = uv_y - dir_y * adjusted_shift;
 
-                    let r_px = (r_x * width_f).clamp(0.0, width_f - 1.0) as u32;
-                    let r_py = (r_y * height_f).clamp(0.0, height_f - 1.0) as u32;
-                    let r_idx = ((r_py * width + r_px) * 4) as usize;
+                let r_px = (r_x * width_f).clamp(0.0, width_f - 1.0) as u32;
+                let r_py = (r_y * height_f).clamp(0.0, height_f - 1.0) as u32;
+                let r_idx = ((r_py * width + r_px) * 4) as usize;
 
-                    let b_px = (b_x * width_f).clamp(0.0, width_f - 1.0) as u32;
-                    let b_py = (b_y * height_f).clamp(0.0, height_f - 1.0) as u32;
-                    let b_idx = ((b_py * width + b_px) * 4) as usize;
+                let b_px = (b_x * width_f).clamp(0.0, width_f - 1.0) as u32;
+                let b_py = (b_y * height_f).clamp(0.0, height_f - 1.0) as u32;
+                let b_idx = ((b_py * width + b_px) * 4) as usize;
 
-                    pixel_bytes[0] = source_raw[r_idx]; // red from shifted position
-                    pixel_bytes[2] = source_raw[b_idx + 2]; // blue from shifted position
-                } else {
-                    // no shift needed, copy from original position
-                    pixel_bytes[0] = source_raw[src_idx]; // red
-                    pixel_bytes[2] = source_raw[src_idx + 2]; // blue
-                }
+                pixel_bytes[0] = source_raw[r_idx]; // red from shifted position
+                pixel_bytes[2] = source_raw[b_idx + 2]; // blue from shifted position
+            } else {
+                // no shift needed, copy from original position
+                pixel_bytes[0] = source_raw[src_idx]; // red
+                pixel_bytes[2] = source_raw[src_idx + 2]; // blue
             }
-        });
+        }
+    }
 }
 
 /// parses chromatic aberration amount from string.

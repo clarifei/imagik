@@ -9,8 +9,12 @@ use image::DynamicImage;
 /// uses `rem_euclid` to normalize angles (handles negative inputs
 /// and angles > 360 gracefully).
 pub fn rotate(img: DynamicImage, angle: i32) -> DynamicImage {
-    match angle.rem_euclid(360) {
-        0 => img,
+    let normalized = angle.rem_euclid(360);
+    if normalized == 0 {
+        return img;
+    }
+
+    match normalized {
         90 => img.rotate90(),
         180 => img.rotate180(),
         270 => img.rotate270(),

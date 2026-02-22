@@ -1,8 +1,7 @@
 /// shared utilities for image transformations.
-pub(crate) mod blur;
-pub(crate) mod color;
-pub(crate) mod image;
-pub(crate) mod metrics;
-pub(crate) mod parser;
-pub(crate) mod pixel;
-pub(crate) mod resize;
+pub mod blur;
+pub mod color;
+pub mod image;
+pub mod parser;
+pub mod pixel;
+pub mod resize;

@@ -1,14 +1,14 @@
 use crate::models::{CropMode, Gravity};
 use crate::utils::pixel::fill_solid;
-use crate::utils::resize::resize_rgba_fast;
-use fast_image_resize::FilterType;
+use crate::utils::resize::resize_rgba_fast_auto;
 use image::{DynamicImage, GenericImageView, RgbaImage};
 use std::borrow::Cow;
+use std::time::Instant;
 
-/// resizes image with specified crop mode - returns rgba directly.
+/// resizes image with specified crop mode, returning rgba directly.
 ///
-/// optimized: skips the dynamicimage wrapper entirely.
-/// use this when you need rgba output for pixel operations.
+/// optimization: bypasses `DynamicImage` wrapper to avoid format conversions.
+/// intended for use when subsequent pixel operations are needed.
 pub fn resize_with_mode(
     img: &DynamicImage,
     width: Option<u32>,
@@ -21,6 +21,10 @@ pub fn resize_with_mode(
     resize_with_mode_rgba(rgba.as_ref(), width, height, mode, gravity, background)
 }
 
+/// resizes rgba image with specified crop mode.
+///
+/// dispatches to mode-specific implementations.
+/// `background` is only used for `CropMode::Pad`.
 pub fn resize_with_mode_rgba(
     img: &RgbaImage,
     width: Option<u32>,
@@ -29,7 +33,8 @@ pub fn resize_with_mode_rgba(
     gravity: Gravity,
     background: Option<[u8; 4]>,
 ) -> RgbaImage {
-    match mode {
+    let start = Instant::now();
+    let result = match mode {
         CropMode::Fill | CropMode::Crop => resize_fill(img, width, height, gravity),
         CropMode::Fit => resize_fit(img, width, height),
         CropMode::Scale => resize_scale(img, width, height),
@@ -37,7 +42,16 @@ pub fn resize_with_mode_rgba(
             let bg = background.unwrap_or([255, 255, 255, 255]);
             resize_pad(img, width, height, bg)
         }
-    }
+    };
+    eprintln!(
+        "[RESIZE] {}x{} -> {:?}x{:?} in {:?}",
+        img.width(),
+        img.height(),
+        width,
+        height,
+        start.elapsed()
+    );
+    result
 }
 
 /// crops image to exact dimensions using gravity for positioning.
@@ -66,6 +80,10 @@ pub fn crop_to_dimensions(
     img.crop_imm(x, y, crop_width, crop_height)
 }
 
+/// resizes to cover target dimensions then crops to exact size.
+///
+/// used for `CropMode::Fill` and `CropMode::Crop`.
+/// scales to cover, then crops using gravity for positioning.
 fn resize_fill(
     img: &RgbaImage,
     width: Option<u32>,
@@ -80,7 +98,8 @@ fn resize_fill(
 
     let (resize_w, resize_h) =
         calculate_cover_dimensions((img.width(), img.height()), target_w, target_h);
-    let resized = resize_rgba_fast(img, resize_w, resize_h, FilterType::Lanczos3);
+    // Use auto-selected fast filter
+    let resized = resize_rgba_fast_auto(img, resize_w, resize_h);
 
     // crop to exact dimensions
     let (img_w, img_h) = (resized.width(), resized.height());
@@ -96,6 +115,9 @@ fn resize_fill(
     crop(&resized, x, y, crop_w, crop_h)
 }
 
+/// resizes to fit within target dimensions without cropping.
+///
+/// preserves aspect ratio. used for `CropMode::Fit`.
 fn resize_fit(img: &RgbaImage, width: Option<u32>, height: Option<u32>) -> RgbaImage {
     let (target_w, target_h) = resolve_dimensions((img.width(), img.height()), width, height);
 
@@ -105,9 +127,12 @@ fn resize_fit(img: &RgbaImage, width: Option<u32>, height: Option<u32>) -> RgbaI
 
     let (new_w, new_h) =
         calculate_contain_dimensions((img.width(), img.height()), target_w, target_h);
-    resize_rgba_fast(img, new_w.max(1), new_h.max(1), FilterType::Lanczos3)
+    resize_rgba_fast_auto(img, new_w.max(1), new_h.max(1))
 }
 
+/// scales image to exact target dimensions.
+///
+/// may distort aspect ratio. used for `CropMode::Scale`.
 fn resize_scale(img: &RgbaImage, width: Option<u32>, height: Option<u32>) -> RgbaImage {
     let (target_w, target_h) = resolve_dimensions((img.width(), img.height()), width, height);
 
@@ -115,9 +140,12 @@ fn resize_scale(img: &RgbaImage, width: Option<u32>, height: Option<u32>) -> Rgb
         return img.clone();
     }
 
-    resize_rgba_fast(img, target_w, target_h, FilterType::Lanczos3)
+    resize_rgba_fast_auto(img, target_w, target_h)
 }
 
+/// resizes to fit within target dimensions and pads with background color.
+///
+/// preserves aspect ratio. centers the image. used for `CropMode::Pad`.
 fn resize_pad(
     img: &RgbaImage,
     width: Option<u32>,
@@ -132,7 +160,8 @@ fn resize_pad(
 
     let (new_w, new_h) =
         calculate_contain_dimensions((img.width(), img.height()), target_w, target_h);
-    let resized = resize_rgba_fast(img, new_w.max(1), new_h.max(1), FilterType::Lanczos3);
+    // Use auto-selected fast filter
+    let resized = resize_rgba_fast_auto(img, new_w.max(1), new_h.max(1));
     let (resized_w, resized_h) = (resized.width(), resized.height());
 
     let mut output = RgbaImage::new(target_w, target_h);
@@ -141,11 +170,21 @@ fn resize_pad(
     let offset_x = (target_w - resized_w) / 2;
     let offset_y = (target_h - resized_h) / 2;
 
-    overlay_rgba(&mut output, &resized, offset_x as i64, offset_y as i64);
+    overlay_rgba(
+        &mut output,
+        &resized,
+        i64::from(offset_x),
+        i64::from(offset_y),
+    );
 
     output
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Source/destination row offsets are bounded by image dimensions and validated before slicing."
+)]
 fn crop(img: &RgbaImage, x: u32, y: u32, width: u32, height: u32) -> RgbaImage {
     let mut result = RgbaImage::new(width, height);
     let img_width = img.width();
@@ -172,6 +211,12 @@ fn crop(img: &RgbaImage, x: u32, y: u32, width: u32, height: u32) -> RgbaImage {
     result
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "Row/column offsets are validated and bounded before index conversion."
+)]
 fn overlay_rgba(dest: &mut RgbaImage, src: &RgbaImage, x: i64, y: i64) {
     let (src_w, src_h) = (src.width() as i64, src.height() as i64);
     let (dest_w, dest_h) = (dest.width() as i64, dest.height() as i64);
@@ -216,6 +261,12 @@ fn overlay_rgba(dest: &mut RgbaImage, src: &RgbaImage, x: i64, y: i64) {
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "Missing-dimension inference uses bounded aspect-ratio arithmetic."
+)]
 fn resolve_dimensions(
     (img_width, img_height): (u32, u32),
     target_width: Option<u32>,
@@ -235,10 +286,16 @@ fn resolve_dimensions(
     }
 }
 
-fn is_valid_size(w: u32, h: u32) -> bool {
+const fn is_valid_size(w: u32, h: u32) -> bool {
     w > 0 && h > 0
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "Dimension scaling uses float ratios with bounded positive inputs."
+)]
 fn calculate_cover_dimensions(
     (img_w, img_h): (u32, u32),
     target_w: u32,
@@ -254,6 +311,12 @@ fn calculate_cover_dimensions(
     }
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    reason = "Contain scaling uses float ratios with bounded positive inputs."
+)]
 fn calculate_contain_dimensions(
     (img_w, img_h): (u32, u32),
     target_w: u32,
@@ -269,7 +332,7 @@ fn calculate_contain_dimensions(
     }
 }
 
-fn calculate_gravity_offset(
+const fn calculate_gravity_offset(
     img_size: u32,
     crop_size: u32,
     gravity: Gravity,
@@ -287,9 +350,6 @@ fn calculate_gravity_offset(
 }
 
 fn source_rgba(img: &DynamicImage) -> Cow<'_, RgbaImage> {
-    if let Some(rgba) = img.as_rgba8() {
-        Cow::Borrowed(rgba)
-    } else {
-        Cow::Owned(img.to_rgba8())
-    }
+    img.as_rgba8()
+        .map_or_else(|| Cow::Owned(img.to_rgba8()), Cow::Borrowed)
 }

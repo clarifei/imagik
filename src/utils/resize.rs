@@ -3,12 +3,12 @@ use fast_image_resize::{CpuExtensions, FilterType, ResizeAlg, ResizeOptions, Res
 use image::RgbaImage;
 use std::sync::OnceLock;
 
-/// fast resize for rgba images using simd-optimized fast_image_resize.
+/// fast resize for rgba images using simd-optimized `fast_image_resize`.
 ///
-/// this is the core resize function used by both transforms/resize.rs
-/// and utils/blur.rs for consistent, optimized resizing.
+/// this is the core resize function used by both `transforms/resize.rs`
+/// and `utils/blur.rs` for consistent, optimized resizing.
 ///
-/// automatically enables avx2 or sse4.1 simd extensions on x86_64.
+/// automatically enables avx2 or sse4.1 simd extensions on `x86_64`.
 pub fn resize_rgba_fast(img: &RgbaImage, width: u32, height: u32, filter: FilterType) -> RgbaImage {
     let src_width = img.width();
     let src_height = img.height();
@@ -90,4 +90,39 @@ pub fn resize_rgba_into(
 fn detected_cpu_extensions() -> &'static CpuExtensions {
     static CPU_EXTENSIONS: OnceLock<CpuExtensions> = OnceLock::new();
     CPU_EXTENSIONS.get_or_init(CpuExtensions::default)
+}
+
+/// Selects optimal filter based on resize ratio.
+/// For large downscales (thumbnails), use faster filters.
+/// For small changes or upscales, use higher quality.
+pub fn select_optimal_filter(src_size: u32, dst_size: u32) -> FilterType {
+    if dst_size == 0 || src_size == 0 {
+        return FilterType::Lanczos3;
+    }
+
+    let ratio = if src_size > dst_size {
+        src_size as f32 / dst_size as f32
+    } else {
+        dst_size as f32 / src_size as f32
+    };
+
+    // Large downscale (>4x) = thumbnail, use fast filter
+    if ratio > 4.0 {
+        FilterType::Hamming // Fast and good quality for thumbnails
+    } else if ratio > 2.0 {
+        FilterType::CatmullRom // Good balance
+    } else {
+        FilterType::Lanczos3 // Best quality for small changes
+    }
+}
+
+/// Fast resize with automatic filter selection based on dimensions.
+pub fn resize_rgba_fast_auto(img: &RgbaImage, width: u32, height: u32) -> RgbaImage {
+    let src_width = img.width();
+    let src_height = img.height();
+
+    // Use width to determine filter (assuming aspect ratio is preserved)
+    let filter = select_optimal_filter(src_width.max(src_height), width.max(height));
+
+    resize_rgba_fast(img, width, height, filter)
 }

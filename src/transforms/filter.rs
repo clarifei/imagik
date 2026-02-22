@@ -10,7 +10,7 @@ pub fn parse_contrast(value: &str) -> Option<f32> {
     parse_f32_range(value, -100.0, 100.0)
 }
 
-/// hue rotation: any integer, normalized to 0-359 using rem_euclid.
+/// hue rotation: any integer, normalized to 0-359 using `rem_euclid`.
 pub fn parse_hue_rotate(value: &str) -> Option<i32> {
     value.parse::<i32>().ok().map(normalize_hue)
 }
